@@ -1,0 +1,27 @@
+{
+  "schema": 2,
+  "versions": [
+    {
+      "version": "pr-1",
+      "ref": "refs/pull/1/merge",
+      "sha": "d9245aa31cb43210089c498462ac2dd9d66ab3ee",
+      "timestamp": "2026-04-22T00:57:55.499Z",
+      "commits": [
+        {
+          "sha": "d9245aa31cb43210089c498462ac2dd9d66ab3ee",
+          "author_name": "Brandon Fryslie",
+          "author_email": "530235+brandon-fryslie@users.noreply.github.com",
+          "timestamp": "2026-04-21T18:57:47-06:00",
+          "message": "Merge 9a90aa52b511384d523d7ae6c1c026c058ffb362 into 3854f55d0f461266ac6821077b1ca04d3588b05c\n"
+        },
+        {
+          "sha": "9a90aa52b511384d523d7ae6c1c026c058ffb362",
+          "author_name": "Brandon Fryslie",
+          "author_email": "530235+brandon-fryslie@users.noreply.github.com",
+          "timestamp": "2026-04-21T18:53:09-06:00",
+          "message": "Add music-reactive shader playground + gh-pages PR previews\n\nDrops in a self-contained music-reactive WebGPU shader playground at\npublic/playgrounds/shader-reactive.html (iPad-friendly, WebGL2 preview\nwith Web Audio FFT, copyable WGSL prompt). Wires up the\nbrandon-fryslie/gh-pages-multiplexer action so every PR and push to\nmain/master gets its own versioned preview URL.\n\nGenerated with [Claude Code](https://claude.ai/code)\nvia [Happy](https://happy.engineering)\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nCo-Authored-By: Happy <yesreply@happy.engineering>\n"
+        }
+      ]
+    }
+  ]
+}
