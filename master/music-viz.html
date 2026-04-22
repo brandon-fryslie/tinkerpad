@@ -1,0 +1,752 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><!-- gh-pages-multiplexer:canonical --><link rel="canonical" href="https://brandon-fryslie.github.io/tinkerpad/master/music-viz.html">
+<base href="/tinkerpad/master/">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Music Visualizer · Tinkerpad</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;overflow:hidden;overscroll-behavior:none;background:#000;color:#e7e8f0;
+  font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',system-ui,sans-serif;font-size:14px}
+
+canvas{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none}
+
+.overlay{position:fixed;inset:0;display:grid;place-items:center;background:rgba(4,5,9,.88);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);z-index:10;padding:24px;padding-top:calc(24px + env(safe-area-inset-top));padding-bottom:calc(24px + env(safe-area-inset-bottom))}
+.card{max-width:480px;width:100%;background:#0e0f16;border:1px solid #272a3a;border-radius:16px;padding:28px;text-align:center}
+.card h1{font-size:20px;font-weight:700;letter-spacing:-.01em;margin-bottom:6px}
+.card h1 .ac{color:#c5b3ff}
+.card p{color:#7b7e95;font-size:13px;line-height:1.55;margin-bottom:22px}
+.sources{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+.sources > *{appearance:none;border:1px solid #272a3a;background:#151722;color:#e7e8f0;padding:14px 10px;border-radius:10px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;display:flex;flex-direction:column;align-items:center;gap:6px;min-height:70px;justify-content:center}
+.sources > *:active{transform:scale(.97)}
+.sources > *:hover{border-color:#9d7bff;background:rgba(157,123,255,.08)}
+.sources .ic{font-size:18px;line-height:1}
+.err{display:none;color:#ff6b7a;font-size:12px;font-family:ui-monospace,'SF Mono',Menlo,monospace;margin-top:14px;padding:10px 12px;background:rgba(255,107,122,.08);border:1px solid rgba(255,107,122,.25);border-radius:8px;text-align:left}
+.err.show{display:block}
+input[type="file"]{display:none}
+
+.chrome{position:fixed;top:calc(env(safe-area-inset-top) + 10px);left:10px;right:10px;display:flex;justify-content:space-between;align-items:center;gap:8px;z-index:5;pointer-events:none;transition:opacity .4s}
+.chrome.hidden{opacity:0}
+.chrome > *{pointer-events:auto}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:7px 12px;border-radius:999px;background:rgba(14,15,22,.72);border:1px solid rgba(39,42,58,.6);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);font-size:12px;font-family:ui-monospace,'SF Mono',Menlo,monospace;color:#c5b3ff}
+.pill .dot{width:6px;height:6px;border-radius:50%;background:#9d7bff;box-shadow:0 0 6px rgba(157,123,255,.8)}
+.pill.mic .dot{background:#ff6b7a;box-shadow:0 0 6px rgba(255,107,122,.8);animation:blink 1s infinite}
+@keyframes blink{50%{opacity:.35}}
+.pill.fps{color:#7b7e95}
+.pill.fps .dot{background:#6bffc3;box-shadow:0 0 6px rgba(107,255,195,.6)}
+.btn-ghost{appearance:none;border:1px solid rgba(39,42,58,.6);background:rgba(14,15,22,.72);color:#e7e8f0;padding:7px 14px;border-radius:999px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);min-height:32px}
+.btn-ghost:active{transform:scale(.97)}
+</style>
+</head>
+<body>
+
+<canvas id="c"></canvas>
+
+<div class="chrome hidden" id="chrome">
+  <div class="pill" id="src-pill"><span class="dot"></span><span id="src-label">demo</span></div>
+  <div style="display:flex;gap:8px;align-items:center">
+    <span class="pill fps"><span class="dot"></span><span id="fps">—</span></span>
+    <button class="btn-ghost" id="switch-btn">Switch</button>
+  </div>
+</div>
+
+<div class="overlay" id="start-overlay">
+  <div class="card">
+    <h1><span class="ac">◈</span> Music Visualizer</h1>
+    <p>Milkdrop-style GPU feedback visualizer. Pick an audio source — tap the canvas later to change it.</p>
+    <div class="sources">
+      <button data-src="demo"><span class="ic">♪</span><span>Demo Beat</span></button>
+      <button data-src="mic"><span class="ic">●</span><span>Microphone</span></button>
+      <label data-src="file"><span class="ic">▸</span><span>Audio File</span><input type="file" id="file-in" accept="audio/*"></label>
+    </div>
+    <div class="err" id="err"></div>
+  </div>
+</div>
+
+<script type="module">
+/* ========================================================================
+ * Music Visualizer — Milkdrop-style WebGPU feedback pipeline
+ * passes:  warp (prevTex → currTex with zoom/rotate/decay)
+ *        → waveform (additive ring onto currTex)
+ *        → present (currTex → canvas, tone-map + vignette)
+ * ====================================================================== */
+
+/* ──────────── WGSL shaders ──────────── */
+
+const COMMON_U = /* wgsl */`
+struct U {
+  res: vec2f,
+  time: f32,
+  bass: f32,
+  mid: f32,
+  treb: f32,
+  beat: f32,
+  decay: f32,
+};
+@group(0) @binding(0) var<uniform> u: U;
+`;
+
+const WARP_WGSL = COMMON_U + /* wgsl */`
+@group(0) @binding(1) var prev: texture_2d<f32>;
+@group(0) @binding(2) var samp: sampler;
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  let p = array(vec2f(-1., -1.), vec2f(3., -1.), vec2f(-1., 3.));
+  return vec4f(p[i], 0., 1.);
+}
+
+@fragment
+fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+  let uv = fc.xy / u.res;
+  let aspect = u.res.x / u.res.y;
+  let c = (uv - vec2f(0.5)) * vec2f(aspect, 1.0);
+  let r = length(c);
+  let a = atan2(c.y, c.x);
+
+  let rot = 0.0035 + u.mid * 0.016 + u.beat * 0.03;
+  let zoomOut = 0.9955 - u.bass * 0.028 - u.beat * 0.022;
+
+  let a2 = a + rot;
+  let r2 = r * zoomOut;
+  var srcC = vec2f(cos(a2), sin(a2)) * r2;
+  var uvSrc = vec2f(srcC.x / aspect, srcC.y) + vec2f(0.5);
+
+  uvSrc += vec2f(
+    sin(u.time * 1.23 + uv.y * 9.0),
+    cos(u.time * 0.97 + uv.x * 9.0)
+  ) * u.treb * 0.005;
+
+  let p = textureSample(prev, samp, uvSrc).rgb;
+  let edge = 1.0 - smoothstep(0.72, 1.12, r * 2.0);
+  let decay = (u.decay - u.beat * 0.05) * edge;
+  return vec4f(p * decay, 1.0);
+}
+`;
+
+const WAVE_WGSL = COMMON_U + /* wgsl */`
+struct VSIn {
+  @location(0) pos: vec2f,
+  @location(1) meta: vec2f,  // x = index fraction 0..1, y = radial offset -1..1
+};
+struct VSOut {
+  @builtin(position) clip: vec4f,
+  @location(0) col: vec3f,
+};
+
+fn hsv(h: f32, s: f32, v: f32) -> vec3f {
+  let k = vec4f(1.0, 2.0/3.0, 1.0/3.0, 3.0);
+  let p = abs(fract(vec3f(h) + k.xyz) * 6.0 - vec3f(k.w));
+  return v * mix(vec3f(1.0), clamp(p - vec3f(1.0), vec3f(0.0), vec3f(1.0)), s);
+}
+
+@vertex
+fn vs(in: VSIn) -> VSOut {
+  var o: VSOut;
+  o.clip = vec4f(in.pos, 0., 1.);
+  let hue = fract(u.time * 0.045 + in.meta.x + u.bass * 0.18);
+  let sat = 0.88 - u.treb * 0.20;
+  let val = 0.95 + u.beat * 0.65;
+  let intensity = 0.55 + abs(in.meta.y) * 0.95;
+  o.col = hsv(hue, sat, val) * intensity;
+  return o;
+}
+
+@fragment
+fn fs(in: VSOut) -> @location(0) vec4f {
+  return vec4f(in.col, 1.);
+}
+`;
+
+const PRESENT_WGSL = COMMON_U + /* wgsl */`
+@group(0) @binding(1) var src: texture_2d<f32>;
+@group(0) @binding(2) var samp: sampler;
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  let p = array(vec2f(-1., -1.), vec2f(3., -1.), vec2f(-1., 3.));
+  return vec4f(p[i], 0., 1.);
+}
+
+@fragment
+fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+  let uv = fc.xy / u.res;
+  var c = textureSample(src, samp, uv).rgb;
+  c = c + c * c * 0.40;
+  let d = distance(uv, vec2f(0.5));
+  let vg = 1.0 - smoothstep(0.22, 0.98, d);
+  c *= vg;
+  c = pow(max(c, vec3f(0.)), vec3f(0.88));
+  return vec4f(c, 1.);
+}
+`;
+
+/* ──────────── WebGPU bootstrap ──────────── */
+
+const canvas = document.getElementById('c');
+const startOverlay = document.getElementById('start-overlay');
+const chrome = document.getElementById('chrome');
+const srcLabel = document.getElementById('src-label');
+const srcPill = document.getElementById('src-pill');
+const fpsEl = document.getElementById('fps');
+const errEl = document.getElementById('err');
+
+let device, context, format, feedbackFormat;
+let texA, texB, texW = 0, texH = 0;
+let warpPipeline, wavePipeline, presentPipeline;
+let bgWave, bgWarpFromA, bgWarpFromB, bgPresentA, bgPresentB;
+let uBuf, waveBuf, sampler;
+const WAVE_N = 256;
+const WAVE_VERTS = (WAVE_N + 1) * 2;
+const waveArr = new Float32Array(WAVE_VERTS * 4);
+
+function showError(msg) {
+  errEl.textContent = msg;
+  errEl.classList.add('show');
+}
+
+async function initGPU() {
+  if (!navigator.gpu) {
+    showError('WebGPU is not available in this browser. Try Safari 17.4+, Chrome/Edge 113+, or Firefox Nightly.');
+    return false;
+  }
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  if (!adapter) {
+    showError('Could not get a WebGPU adapter. GPU might not be supported.');
+    return false;
+  }
+  device = await adapter.requestDevice();
+  device.lost.then(info => {
+    console.error('WebGPU device lost:', info);
+    showError('GPU device was lost. Reload the page.');
+  });
+
+  context = canvas.getContext('webgpu');
+  format = navigator.gpu.getPreferredCanvasFormat();
+  context.configure({ device, format, alphaMode: 'opaque' });
+
+  feedbackFormat = adapter.features.has('float32-filterable') ? 'rgba16float' : 'rgba16float';
+
+  sampler = device.createSampler({
+    magFilter: 'linear', minFilter: 'linear',
+    addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge',
+  });
+
+  uBuf = device.createBuffer({
+    size: 32,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
+  waveBuf = device.createBuffer({
+    size: waveArr.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+  });
+
+  const warpModule = device.createShaderModule({ code: WARP_WGSL });
+  const waveModule = device.createShaderModule({ code: WAVE_WGSL });
+  const presentModule = device.createShaderModule({ code: PRESENT_WGSL });
+
+  warpPipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module: warpModule, entryPoint: 'vs' },
+    fragment: { module: warpModule, entryPoint: 'fs', targets: [{ format: feedbackFormat }] },
+    primitive: { topology: 'triangle-list' },
+  });
+
+  wavePipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: {
+      module: waveModule, entryPoint: 'vs',
+      buffers: [{
+        arrayStride: 16,
+        attributes: [
+          { shaderLocation: 0, offset: 0, format: 'float32x2' },
+          { shaderLocation: 1, offset: 8, format: 'float32x2' },
+        ],
+      }],
+    },
+    fragment: {
+      module: waveModule, entryPoint: 'fs',
+      targets: [{
+        format: feedbackFormat,
+        blend: {
+          color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
+          alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
+        },
+      }],
+    },
+    primitive: { topology: 'triangle-strip' },
+  });
+
+  presentPipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module: presentModule, entryPoint: 'vs' },
+    fragment: { module: presentModule, entryPoint: 'fs', targets: [{ format }] },
+    primitive: { topology: 'triangle-list' },
+  });
+
+  bgWave = device.createBindGroup({
+    layout: wavePipeline.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: uBuf } }],
+  });
+
+  return true;
+}
+
+function resizeAndRebuildTextures() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.max(2, Math.floor(canvas.clientWidth * dpr));
+  const h = Math.max(2, Math.floor(canvas.clientHeight * dpr));
+  if (w === texW && h === texH) return;
+  texW = w; texH = h;
+  canvas.width = w; canvas.height = h;
+
+  if (texA) texA.destroy();
+  if (texB) texB.destroy();
+
+  const texDesc = {
+    size: [texW, texH],
+    format: feedbackFormat,
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
+  };
+  texA = device.createTexture(texDesc);
+  texB = device.createTexture(texDesc);
+
+  const mkBG = (pipeline, tex) => device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uBuf } },
+      { binding: 1, resource: tex.createView() },
+      { binding: 2, resource: sampler },
+    ],
+  });
+
+  bgWarpFromA = mkBG(warpPipeline, texA);
+  bgWarpFromB = mkBG(warpPipeline, texB);
+  bgPresentA = mkBG(presentPipeline, texA);
+  bgPresentB = mkBG(presentPipeline, texB);
+}
+
+/* ──────────── Audio ──────────── */
+
+let audioCtx, analyser, freqData, timeData;
+let audioSource = 'none', currentSourceNode = null, currentStream = null, demoTimer = null;
+let bass = 0, mid = 0, treb = 0, beat = 0, beatRunning = 0, lastBeatTs = 0;
+
+function ensureCtx() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 2048;
+    analyser.smoothingTimeConstant = 0.55;
+    freqData = new Uint8Array(analyser.frequencyBinCount);
+    timeData = new Uint8Array(analyser.fftSize);
+  }
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  return audioCtx;
+}
+
+function stopAudio() {
+  if (demoTimer) { clearInterval(demoTimer); demoTimer = null; }
+  if (currentStream) { currentStream.getTracks().forEach(t => t.stop()); currentStream = null; }
+  if (currentSourceNode) {
+    try { currentSourceNode.stop(); } catch(e) {}
+    try { currentSourceNode.disconnect(); } catch(e) {}
+    currentSourceNode = null;
+  }
+  if (analyser) { try { analyser.disconnect(); } catch(e) {} }
+  audioSource = 'none';
+  bass = mid = treb = beat = 0;
+}
+
+async function startMic() {
+  stopAudio(); ensureCtx();
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+  });
+  currentStream = stream;
+  const src = audioCtx.createMediaStreamSource(stream);
+  currentSourceNode = src;
+  src.connect(analyser);
+  audioSource = 'mic';
+}
+
+async function startFile(file) {
+  stopAudio(); ensureCtx();
+  const arr = await file.arrayBuffer();
+  const buf = await audioCtx.decodeAudioData(arr);
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf; src.loop = true;
+  src.connect(analyser);
+  analyser.connect(audioCtx.destination);
+  src.start(0);
+  currentSourceNode = src;
+  audioSource = 'file';
+}
+
+function startDemo() {
+  stopAudio(); ensureCtx();
+  const gain = audioCtx.createGain();
+  gain.gain.value = 0.35;
+  gain.connect(analyser);
+  analyser.connect(audioCtx.destination);
+
+  const bpm = 120, sixteenth = 60 / bpm / 4;
+  let step = 0, nextNoteTime = audioCtx.currentTime + 0.08;
+
+  const kick = t => {
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(130, t);
+    o.frequency.exponentialRampToValueAtTime(45, t + 0.12);
+    g.gain.setValueAtTime(0.95, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.38);
+    o.connect(g).connect(gain); o.start(t); o.stop(t + 0.42);
+  };
+  const hat = (t, open) => {
+    const n = audioCtx.sampleRate * (open ? 0.13 : 0.05);
+    const buf = audioCtx.createBuffer(1, n, audioCtx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * Math.exp(-i / (n * 0.28));
+    const s = audioCtx.createBufferSource(); s.buffer = buf;
+    const hp = audioCtx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 7500;
+    const g = audioCtx.createGain(); g.gain.value = open ? 0.28 : 0.18;
+    s.connect(hp).connect(g).connect(gain); s.start(t);
+  };
+  const stab = (t, f) => {
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain(), filt = audioCtx.createBiquadFilter();
+    filt.type = 'lowpass'; filt.frequency.value = 1400 + Math.random() * 600;
+    o.type = 'sawtooth'; o.frequency.value = f;
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(0.18, t + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.22);
+    o.connect(filt).connect(g).connect(gain); o.start(t); o.stop(t + 0.25);
+  };
+
+  const bassNotes = [55, 55, 82, 65, 55, 55, 73, 98];
+  demoTimer = setInterval(() => {
+    const horizon = audioCtx.currentTime + 0.25;
+    while (nextNoteTime < horizon) {
+      const s16 = step % 16;
+      const bar = Math.floor(step / 16);
+      if (s16 % 4 === 0) kick(nextNoteTime);
+      if (s16 % 4 === 2) hat(nextNoteTime, false);
+      else if (s16 % 2 === 1) hat(nextNoteTime, s16 === 7 || s16 === 15);
+      if (s16 % 2 === 0) stab(nextNoteTime, bassNotes[((bar * 8) + (s16 >> 1)) % bassNotes.length]);
+      step++; nextNoteTime += sixteenth;
+    }
+  }, 25);
+
+  currentSourceNode = { stop() {}, disconnect() { try { gain.disconnect(); } catch(e) {} } };
+  audioSource = 'demo';
+}
+
+function analyseAudio() {
+  if (!analyser || audioSource === 'none') {
+    bass *= 0.9; mid *= 0.9; treb *= 0.9; beat *= 0.85;
+    return;
+  }
+  analyser.getByteFrequencyData(freqData);
+  analyser.getByteTimeDomainData(timeData);
+  const nyquist = audioCtx.sampleRate / 2;
+  const binsPerHz = freqData.length / nyquist;
+  const avg = (lo, hi) => {
+    const s = Math.max(0, Math.floor(lo * binsPerHz));
+    const e = Math.min(freqData.length - 1, Math.ceil(hi * binsPerHz));
+    let sum = 0, n = 0;
+    for (let i = s; i <= e; i++) { sum += freqData[i]; n++; }
+    return n ? (sum / n) / 255 : 0;
+  };
+  const rawB = avg(20, 160);
+  bass = Math.min(1, rawB * 1.3);
+  mid  = Math.min(1, avg(200, 2000) * 1.0);
+  treb = Math.min(1, avg(2000, 8000) * 1.1);
+  const now = performance.now();
+  beatRunning = beatRunning * 0.92 + rawB * 0.08;
+  if (rawB > beatRunning * 1.4 + 0.08 && now - lastBeatTs > 140) {
+    lastBeatTs = now;
+    beat = 1.0;
+  }
+  beat *= 0.88;
+}
+
+/* ──────────── Waveform geometry (aspect-correct closed ring) ──────────── */
+
+function computeWaveVerts(aspect) {
+  const ax = aspect >= 1 ? 1 / aspect : 1;
+  const ay = aspect >= 1 ? 1 : aspect;
+  const rIn = 0.30;
+  const amp = 0.18 + bass * 0.25 + beat * 0.18;
+  for (let i = 0; i <= WAVE_N; i++) {
+    const idx = i % WAVE_N;
+    const theta = (i / WAVE_N) * Math.PI * 2;
+    const c = Math.cos(theta), s = Math.sin(theta);
+    const sample = timeData ? ((timeData[Math.floor(idx * timeData.length / WAVE_N)] - 128) / 128) : 0;
+    const rOut = rIn + sample * amp;
+    const iFrac = idx / WAVE_N;
+    const base = i * 8;
+    waveArr[base + 0] = c * rIn * ax;
+    waveArr[base + 1] = s * rIn * ay;
+    waveArr[base + 2] = iFrac;
+    waveArr[base + 3] = 0;
+    waveArr[base + 4] = c * rOut * ax;
+    waveArr[base + 5] = s * rOut * ay;
+    waveArr[base + 6] = iFrac;
+    waveArr[base + 7] = sample;
+  }
+}
+
+/* ──────────── Frame loop ──────────── */
+
+let frameCount = 0, fpsCount = 0, fpsLast = 0;
+const startTime = performance.now();
+
+function frame() {
+  resizeAndRebuildTextures();
+  analyseAudio();
+
+  const aspect = texW / texH;
+  computeWaveVerts(aspect);
+
+  const t = (performance.now() - startTime) / 1000;
+  const u = new Float32Array([texW, texH, t, bass, mid, treb, beat, 0.965]);
+  device.queue.writeBuffer(uBuf, 0, u);
+  device.queue.writeBuffer(waveBuf, 0, waveArr);
+
+  const writeA = (frameCount & 1) === 0;
+  const dstView = (writeA ? texA : texB).createView();
+  const bgWarp  = writeA ? bgWarpFromB : bgWarpFromA;
+  const bgPres  = writeA ? bgPresentA  : bgPresentB;
+
+  const cmd = device.createCommandEncoder();
+
+  {
+    const pass = cmd.beginRenderPass({
+      colorAttachments: [{ view: dstView, loadOp: 'clear',
+        clearValue: { r: 0, g: 0, b: 0, a: 1 }, storeOp: 'store' }],
+    });
+    pass.setPipeline(warpPipeline);
+    pass.setBindGroup(0, bgWarp);
+    pass.draw(3);
+    pass.end();
+  }
+  {
+    const pass = cmd.beginRenderPass({
+      colorAttachments: [{ view: dstView, loadOp: 'load', storeOp: 'store' }],
+    });
+    pass.setPipeline(wavePipeline);
+    pass.setBindGroup(0, bgWave);
+    pass.setVertexBuffer(0, waveBuf);
+    pass.draw(WAVE_VERTS);
+    pass.end();
+  }
+  {
+    const pass = cmd.beginRenderPass({
+      colorAttachments: [{ view: context.getCurrentTexture().createView(),
+        loadOp: 'clear', clearValue: { r: 0, g: 0, b: 0, a: 1 }, storeOp: 'store' }],
+    });
+    pass.setPipeline(presentPipeline);
+    pass.setBindGroup(0, bgPres);
+    pass.draw(3);
+    pass.end();
+  }
+
+  device.queue.submit([cmd.finish()]);
+  frameCount++;
+
+  fpsCount++;
+  const now = performance.now();
+  if (now - fpsLast > 500) {
+    fpsEl.textContent = Math.round(fpsCount * 1000 / (now - fpsLast)) + ' fps';
+    fpsCount = 0; fpsLast = now;
+  }
+  requestAnimationFrame(frame);
+}
+
+/* ──────────── UI wiring ──────────── */
+
+async function handleSource(kind, file) {
+  try {
+    if (kind === 'mic') await startMic();
+    else if (kind === 'file') await startFile(file);
+    else startDemo();
+  } catch (e) {
+    showError((kind === 'mic' ? 'Microphone access denied or unavailable: ' : 'Audio failed: ') + (e?.message || e));
+    return;
+  }
+  srcLabel.textContent = kind;
+  srcPill.classList.toggle('mic', kind === 'mic');
+  startOverlay.style.display = 'none';
+  revealChrome();
+  if (!frameRunning) { frameRunning = true; requestAnimationFrame(frame); }
+}
+
+let frameRunning = false;
+let chromeHideT;
+function revealChrome() {
+  chrome.classList.remove('hidden');
+  clearTimeout(chromeHideT);
+  chromeHideT = setTimeout(() => chrome.classList.add('hidden'), 3500);
+}
+
+document.querySelectorAll('.sources > [data-src]').forEach(btn => {
+  if (btn.dataset.src === 'file') return;
+  btn.addEventListener('click', () => handleSource(btn.dataset.src));
+});
+document.getElementById('file-in').addEventListener('change', e => {
+  const f = e.target.files?.[0];
+  if (f) handleSource('file', f);
+});
+document.getElementById('switch-btn').addEventListener('click', () => {
+  stopAudio();
+  startOverlay.style.display = 'grid';
+});
+
+canvas.addEventListener('click', revealChrome);
+document.addEventListener('gesturestart', e => e.preventDefault());
+
+/* ──────────── Boot ──────────── */
+
+const gpuOK = await initGPU();
+if (!gpuOK) {
+  document.querySelectorAll('.sources > *').forEach(b => b.setAttribute('disabled', ''));
+  document.querySelectorAll('.sources > *').forEach(b => b.style.opacity = '0.4');
+}
+</script>
+<script><!-- gh-pages-multiplexer:nav-widget -->
+(function(){
+  var MANIFEST_URL = "../versions.json";
+  var INDEX_URL = "../_versions/";
+  var CURRENT = "master";
+  var ICON_SVG = "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z\"/><path d=\"m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65\"/><path d=\"m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65\"/><\/svg>";
+  var LABEL_TEMPLATE = "{version}";
+  var POSITION = "right 80%";
+  var COLOR = "#f97316";
+  var SHADOW_CSS = "\n:host { all: initial; }\n*, *::before, *::after { box-sizing: border-box; }\n.root {\n  --widget-bg: #ffffff;\n  --widget-bg-hover: #f6f8fa;\n  --widget-fg: #1f2328;\n  --widget-fg-muted: #656d76;\n  --widget-border: #d0d7de;\n  --widget-accent: #0969da;\n  --widget-accent-hover: #0550ae;\n  --widget-current-bg: #ddf4ff;\n  /* Handle colors — intentionally bright and theme-independent so the tab is obvious on any host page.\n     --handle-bg is overridden at runtime by the user's --widget-color when set. The hover state\n     uses CSS filter rather than a separate color variable, so it works for any base color. */\n  --handle-bg: #f97316;\n  --handle-fg: #ffffff;\n  /* Drawer geometry (single source of truth for the slide math). */\n  --panel-width: 240px;\n  --handle-width: 44px;\n  --peek: 10px;\n  /* Position and edge are runtime-configurable. The drawer's center sits on this y-line. */\n  --position-y: 80%;\n  font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, sans-serif;\n  font-size: 13px;\n  line-height: 1.4;\n  color: var(--widget-fg);\n}\n@media (prefers-color-scheme: dark) {\n  .root {\n    --widget-bg: #161b22;\n    --widget-bg-hover: #21262d;\n    --widget-fg: #e6edf3;\n    --widget-fg-muted: #8d96a0;\n    --widget-border: #30363d;\n    --widget-accent: #2f81f7;\n    --widget-accent-hover: #539bf5;\n    --widget-current-bg: #0c2d6b;\n  }\n}\n.drawer {\n  position: fixed;\n  /* The drawer's vertical center sits on --position-y (configurable; default 80%). */\n  top: var(--position-y);\n  display: flex;\n  flex-direction: row;\n  align-items: center;\n  z-index: 2147483647;\n  transition: transform 220ms cubic-bezier(0.2, 0.8, 0.2, 1);\n  will-change: transform;\n}\n@media (prefers-reduced-motion: reduce) {\n  .drawer { transition: none; }\n}\n/* [LAW:dataflow-not-control-flow] Edge variant is data: a class on the drawer picks\n   the right anchor + transform direction. No JS state-toggling for layout — only the\n   class assignment at construction time, then CSS does the rest. */\n.drawer.edge-right {\n  right: 0;\n  transform: translate(var(--panel-width), -50%);\n}\n.drawer.edge-right:hover:not(.open) {\n  transform: translate(calc(var(--panel-width) - var(--peek)), -50%);\n}\n.drawer.edge-right.open {\n  transform: translate(0, -50%);\n}\n.drawer.edge-left {\n  left: 0;\n  flex-direction: row-reverse;\n  transform: translate(calc(-1 * var(--panel-width)), -50%);\n}\n.drawer.edge-left:hover:not(.open) {\n  transform: translate(calc(-1 * (var(--panel-width) - var(--peek))), -50%);\n}\n.drawer.edge-left.open {\n  transform: translate(0, -50%);\n}\n.handle {\n  width: var(--handle-width);\n  background: var(--handle-bg);\n  color: var(--handle-fg);\n  border: none;\n  cursor: pointer;\n  /* Padding is content-driven; the icon and label have their own transitions and the\n     handle shrink-wraps to match (no min-height). */\n  padding: 8px 6px;\n  display: flex;\n  flex-direction: column;\n  align-items: center;\n  justify-content: center;\n  gap: 0;\n  font-family: inherit;\n  font-weight: 600;\n  letter-spacing: 0.01em;\n  flex: 0 0 auto;\n  transition: padding 180ms ease-out, filter 180ms ease-out;\n}\n/* [LAW:single-enforcer] Hover darkening uses CSS filter rather than a separate\n   --handle-bg-hover variable so it works for any user-provided color without forcing\n   the user to specify two shades. */\n.handle:hover { filter: brightness(0.92); }\n.handle:focus-visible {\n  outline: 2px solid #ffffff;\n  outline-offset: -4px;\n}\n/* Right-edge handle: rounded LEFT side (the side facing the viewport). */\n.drawer.edge-right .handle {\n  border-top-left-radius: 14px;\n  border-bottom-left-radius: 14px;\n  box-shadow: -4px 0 16px rgba(0,0,0,0.22), inset 1px 0 0 rgba(255,255,255,0.15);\n}\n/* Left-edge handle: rounded RIGHT side (the side facing the viewport). */\n.drawer.edge-left .handle {\n  border-top-right-radius: 14px;\n  border-bottom-right-radius: 14px;\n  box-shadow: 4px 0 16px rgba(0,0,0,0.22), inset -1px 0 0 rgba(255,255,255,0.15);\n}\n/* [LAW:dataflow-not-control-flow] Closed state shows a small icon only. Hover or open\n   state expands the icon and reveals the label. The CSS always applies, the difference\n   is data — the .open class and the :hover pseudo. No JS state-toggling for these. */\n.handle svg {\n  width: 12px;\n  height: 12px;\n  flex-shrink: 0;\n  display: block;\n  transition: width 180ms ease-out, height 180ms ease-out;\n}\n.drawer:hover .handle svg,\n.drawer.open .handle svg {\n  width: 22px;\n  height: 22px;\n}\n.handle .ver {\n  font-size: 11px;\n  line-height: 1.15;\n  max-width: 40px;\n  max-height: 0;\n  margin-top: 0;\n  opacity: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n  font-variant-numeric: tabular-nums;\n  text-align: center;\n  transition: max-height 180ms ease-out, opacity 180ms ease-out, margin-top 180ms ease-out;\n}\n.drawer:hover .handle .ver,\n.drawer.open .handle .ver {\n  max-height: 16px;\n  margin-top: 6px;\n  opacity: 1;\n}\n.panel {\n  width: var(--panel-width);\n  max-height: 60vh;\n  overflow-y: auto;\n  background: var(--widget-bg);\n  color: var(--widget-fg);\n  border: 1px solid var(--widget-border);\n  padding: 12px;\n  flex: 0 0 auto;\n}\n.drawer.edge-right .panel {\n  border-right: none;\n  box-shadow: -8px 0 24px rgba(0,0,0,0.18);\n}\n.drawer.edge-left .panel {\n  border-left: none;\n  box-shadow: 8px 0 24px rgba(0,0,0,0.18);\n}\n.panel h2 { font-size: 13px; margin: 0 0 8px 0; font-weight: 600; }\n.index-link {\n  display: block;\n  padding: 8px 12px;\n  color: var(--widget-accent);\n  text-decoration: none;\n  border-radius: 6px;\n  margin-bottom: 4px;\n}\n.index-link:hover { background: var(--widget-bg-hover); }\n.index-link:focus-visible { outline: 2px solid var(--widget-accent); outline-offset: 2px; }\n.rows { display: flex; flex-direction: column; gap: 2px; }\n.row {\n  display: block;\n  padding: 8px 12px;\n  border-radius: 6px;\n  text-decoration: none;\n  color: var(--widget-fg);\n}\n.row:hover { background: var(--widget-bg-hover); }\n.row:focus-visible { outline: 2px solid var(--widget-accent); outline-offset: 2px; }\n.row .ver { font-weight: 600; }\n.row.current { background: var(--widget-current-bg); cursor: default; }\n.row .ref { font-family: ui-monospace, \"SF Mono\", Menlo, Consolas, monospace; font-size: 12px; color: var(--widget-fg-muted); }\n.badge {\n  display: inline-block;\n  font-size: 10px;\n  padding: 1px 6px;\n  border-radius: 10px;\n  background: var(--widget-accent);\n  color: #fff;\n  margin-left: 6px;\n  vertical-align: middle;\n}\n.state { padding: 8px 12px; color: var(--widget-fg-muted); }\n@media (max-width: 600px) {\n  .root { --panel-width: calc(100vw - 72px); }\n}\n";
+  var SHADOW_HTML = "\n<div class=\"root\">\n  <div class=\"drawer\" role=\"region\" aria-label=\"Version switcher\">\n    <button class=\"handle\" type=\"button\" aria-expanded=\"false\" aria-controls=\"gh-pm-nav-panel\" aria-label=\"Switch version\">\n      <span class=\"icon-slot\"><\/span>\n      <span class=\"ver\"><\/span>\n    <\/button>\n    <div class=\"panel\" id=\"gh-pm-nav-panel\" role=\"dialog\" aria-label=\"Versions\">\n      <h2>Versions<\/h2>\n      <a class=\"index-link\" href=\"\">← Index<\/a>\n      <div class=\"rows\"><div class=\"state\">Loading versions…<\/div><\/div>\n    <\/div>\n  <\/div>\n<\/div>\n";
+  if (customElements.get('gh-pm-nav')) return;
+  var GhPmNav = function(){};
+  GhPmNav.prototype = Object.create(HTMLElement.prototype);
+  function defineEl(){
+    class GhPmNav extends HTMLElement {
+      constructor(){
+        super();
+        var root = this.attachShadow({ mode: 'open' });
+        root.innerHTML = '<style>' + SHADOW_CSS + '</style>' + SHADOW_HTML;
+        this._root = root;
+        this._open = false;
+        this._loaded = false;
+        this._versions = null;
+        this._error = null;
+        this._drawer = root.querySelector('.drawer');
+        this._handle = root.querySelector('.handle');
+        this._panel = root.querySelector('.panel');
+        this._rows = root.querySelector('.rows');
+        this._indexLink = root.querySelector('.index-link');
+        this._indexLink.setAttribute('href', INDEX_URL);
+        // Inject custom icon SVG into the icon-slot. innerHTML in Shadow DOM does NOT
+        // execute scripts, so even malformed SVG is safe to render.
+        var iconSlot = root.querySelector('.handle .icon-slot');
+        if (iconSlot) { iconSlot.innerHTML = ICON_SVG; }
+        // Substitute {version} in the label template, then assign via textContent
+        // (no HTML interpretation).
+        var verSpan = root.querySelector('.handle .ver');
+        var labelText = LABEL_TEMPLATE.split('{version}').join(CURRENT);
+        if (verSpan) { verSpan.textContent = labelText; }
+        this._handle.setAttribute('aria-label', 'Switch version (current: ' + CURRENT + ')');
+        // Apply position: parse "<edge> <vertical%>" and set drawer class + CSS var.
+        var posParts = POSITION.trim().split(/\s+/);
+        var edge = (posParts[0] === 'left') ? 'left' : 'right';
+        var verticalY = posParts[1] || '80%';
+        this._drawer.classList.add('edge-' + edge);
+        var rootEl = root.querySelector('.root');
+        if (rootEl) {
+          rootEl.style.setProperty('--position-y', verticalY);
+          if (COLOR) { rootEl.style.setProperty('--handle-bg', COLOR); }
+        }
+        this._onDocClick = this._onDocClick.bind(this);
+        this._onKey = this._onKey.bind(this);
+        this._handle.addEventListener('click', this._toggle.bind(this));
+      }
+      _toggle(){
+        this._open ? this._close() : this._open_();
+      }
+      _open_(){
+        this._open = true;
+        this._drawer.classList.add('open');
+        this._handle.setAttribute('aria-expanded', 'true');
+        document.addEventListener('click', this._onDocClick, true);
+        document.addEventListener('keydown', this._onKey, true);
+        if (!this._loaded) { this._fetch(); }
+        var first = this._panel.querySelector('a, button, [tabindex]');
+        if (first) first.focus();
+      }
+      _close(){
+        this._open = false;
+        this._drawer.classList.remove('open');
+        this._handle.setAttribute('aria-expanded', 'false');
+        document.removeEventListener('click', this._onDocClick, true);
+        document.removeEventListener('keydown', this._onKey, true);
+        this._handle.focus();
+      }
+      _onDocClick(e){
+        var path = e.composedPath ? e.composedPath() : [];
+        if (path.indexOf(this) === -1) { this._close(); }
+      }
+      _onKey(e){
+        if (e.key === 'Escape') { this._close(); }
+      }
+      _fetch(){
+        var self = this;
+        fetch(MANIFEST_URL).then(function(r){
+          if (!r.ok) throw new Error('manifest http ' + r.status);
+          return r.json();
+        }).then(function(data){
+          self._loaded = true;
+          self._versions = (data && data.versions) || [];
+          self._render();
+        }).catch(function(err){
+          self._loaded = true;
+          self._error = err;
+          self._render();
+        });
+      }
+      _render(){
+        if (this._error) {
+          this._rows.innerHTML = '<div class="state">Could not load versions</div>';
+          return;
+        }
+        var versions = this._versions || [];
+        var html = '';
+        for (var i = 0; i < versions.length; i++) {
+          var v = versions[i];
+          var name = String(v.version || '');
+          var ref = String(v.ref || '');
+          var isCurrent = (name === CURRENT);
+          var safeName = name.replace(/[&<>"']/g, function(c){
+            return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
+          });
+          var safeRef = ref.replace(/[&<>"']/g, function(c){
+            return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
+          });
+          if (isCurrent) {
+            html += '<div class="row current"><span class="ver">' + safeName + '</span><span class="badge">current</span><div class="ref">' + safeRef + '</div></div>';
+          } else {
+            html += '<a class="row" href="../' + encodeURIComponent(name) + '/"><span class="ver">' + safeName + '</span><div class="ref">' + safeRef + '</div></a>';
+          }
+        }
+        if (!html) { html = '<div class="state">No versions</div>'; }
+        this._rows.innerHTML = html;
+      }
+    }
+    customElements.define('gh-pm-nav', GhPmNav);
+  }
+  defineEl();
+  var el = document.createElement('gh-pm-nav');
+  (document.body || document.documentElement).appendChild(el);
+})();
+</script></body>
+</html>
